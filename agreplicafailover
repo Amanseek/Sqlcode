@@ -1,0 +1,189 @@
+
+
+
+CREATE or Alter PROC [dbo].[p_dba_show_Alwayson_AG_replica_failover]
+@sendmail BIT = 1,
+@ToEmail varchar(500) = 'AMANG@CORECARD.COM'--'DBA-Process-AlwaysOnfailover-Email-List'
+
+
+AS 
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+SET NOCOUNT ON
+/***********************************************INTRODUCTION*********************************************************************************
+	
+Author:                SE AdminDB Experts.
+
+Purpose:             To monitor the health of both the replicas in an automatic failover set 
+
+Description:  
+1.				This proc uses the xtended events to read the info from the targated event file.   
+2.		        The proc monitors the health of both the replicas in automatic failover.If the primary replica fails and availability group                will failover to secondary replica it send an alert to the @toemail recipients                
+
+@Parameters Explained:
+@sendMail							----	is 1 when you need to send email to the recipients about Proc output.
+@ToEmail							----	Contains the list of email recipients to whome the output of Proc is to be sent.
+					
+Sample Execution parameters:   
+EXEC p_dba_show_Alwayson_AG_replica_failover
+@sendmail= 0,
+@ToEmail = 'DBA-Process-AlwaysOnfailover-Email-List'
+
+********************************************************************************************************************************************/
+
+
+BEGIN
+DECLARE @server_name Sysname
+	SELECT @server_name = @@servername
+	IF  OBJECT_ID('tempdb..#Alwayson_newroles') IS NOT NULL DROP TABLE #Alwayson_newroles
+
+	DECLARE @FileName NVARCHAR(4000)
+SELECT @FileName = target_data.value('(EventFileTarget/File/@name)[1]','nvarchar(4000)')
+FROM (
+SELECT
+CAST(target_data AS XML) target_data
+FROM sys.dm_xe_sessions s
+JOIN sys.dm_xe_session_targets t
+ON s.address = t.event_session_address
+WHERE s.name = N'AlwaysOn_health'
+) ft
+SELECT TOP 1 
+--XEData.value('(event/@timestamp)[1]','datetime2(3)') AS event_timestamp,
+--XEData.value('(event/data[@name="previous_state"]/text)[1]', 'varchar(255)') AS previous_state,
+XEData.value('(event/data[@name="availability_replica_name"]/value)[1]', 'varchar(255)') AS AlwaysON_Replica_Name,
+CASE WHEN XEData.value('(event/data[@name="current_state"]/text)[1]', 'varchar(255)') = 'SECONDARY_NORMAL' THEN 'SECONDARY REPLICA'
+WHEN XEData.value('(event/data[@name="current_state"]/text)[1]', 'varchar(255)') = 'PRIMARY_NORMAL' THEN 'PRIMARY REPLICA'
+ELSE XEData.value('(event/data[@name="current_state"]/text)[1]', 'varchar(255)') END AS Replica_State,
+XEData.value('(event/data[@name="availability_group_name"]/value)[1]', 'varchar(255)') AS AG_name
+INTO #Alwayson_newroles 
+  FROM (
+SELECT CAST(event_data AS XML) XEData, *
+FROM sys.fn_xe_file_target_read_file(@FileName, NULL, NULL, NULL)
+WHERE object_name = 'availability_replica_state_change'
+) event_data
+--WHERE XEData.value('(event/data[@name="current_state"]/text)[1]', 'varchar(255)') = 'PRIMARY_NORMAL'
+ORDER BY XEData.value('(event/@timestamp)[1]','datetime2(3)') DESC;
+
+SELECT * FROM #Alwayson_newroles 
+
+DECLARE @current_state VARCHAR(100), @AlwaysON_Replica_Name VARCHAR(100), @availability_group_name VARCHAR(100), @Secondary_replica VARCHAR(100)
+SELECT @current_state =  Replica_State, @AlwaysON_Replica_Name = AlwaysON_Replica_Name, @availability_group_name = AG_name  FROM #Alwayson_newroles
+
+
+SELECT hags.primary_replica
+  FROM sys.dm_hadr_availability_group_states hags
+  INNER JOIN sys.availability_groups ag ON ag.group_id = hags.group_id
+  WHERE ag.name = @availability_group_name
+
+  
+IF @sendmail = 1 AND (SELECT hags.primary_replica
+  FROM sys.dm_hadr_availability_group_states hags
+  INNER JOIN sys.availability_groups ag ON ag.group_id = hags.group_id
+  WHERE ag.name = @availability_group_name) = @@SERVERNAME
+BEGIN
+DECLARE @p_recipients VARCHAR(1000)
+SELECT @p_recipients= info_value
+FROM [tb_info] WHERE [Info_Key]=@ToEmail
+		
+SELECT @p_recipients = ISNULL(@p_recipients,@ToEmail) 
+SELECT @p_recipients Recipient_email
+IF  EXISTS (SELECT * FROM tempdb.sys.objects WHERE object_id = OBJECT_ID(N'tempdb..[#TempTableForConvertToHTML981]') AND type in (N'U'))   
+ DROP TABLE [#TempTableForConvertToHTML981] 
+  IF  EXISTS (SELECT * FROM tempdb.sys.objects WHERE object_id = OBJECT_ID(N'tempdb..[#error_log_local]') AND type in (N'U'))   
+ DROP TABLE [#error_log_local] 
+ 
+ CREATE TABLE #error_log_local
+ (
+ [Log date] DATETIME,
+ [Process Info] Char(10),
+ [Text] NVARCHAR(MAX)
+ )
+ INSERT INTO #error_log_local
+ EXEC Xp_readerrorlog 0,1,"A connection for availability group"
+
+SELECT TOP 1 @Secondary_replica = SUBSTRING([Text],CHARINDEX('to ''' , [Text]) + LEN('to '''),(CHARINDEX('''',[Text], CHARINDEX('to ''' , [Text]) + LEN('to ''') )-1)-CHARINDEX('to ''' , [Text]) - LEN('to ''')+ 1) FROM #error_log_local
+ --WHERE [log Date] > DATEADD(MINUTE,-30,GETDATE()) 
+ WHERE (SELECT TOP 1 SUBSTRING([Text],CHARINDEX('for availability group ''' , [Text]) + LEN('for availability group '''),(CHARINDEX('''',[Text], CHARINDEX('for availability group ''' , [Text]) + LEN('for availability group ''') )-1)-CHARINDEX('for availability group ''' , [Text]) - LEN('for availability group ''')+ 1) FROM #error_log_local  ORDER BY [log Date] DESC) = @availability_group_name
+ ORDER BY [log Date] DESC
+
+		DECLARE @P_SERVERNAME VARCHAR(100)
+		--DECLARE @p_subject	  VARCHAR(500) 
+		DECLARE @Profile_Name VARCHAR(100)
+		--DECLARE @Subject_AlwaysOnfailover VARCHAR(500)='!!! AlwaysON - Replica has failed over to ' + @@servername
+		--DECLARE @Html_Title_AlwaysOnfailover VARCHAR(500)='Please check...AG has changed its primary state '+ ISNULL('from replica ' + @Secondary_replica + ' to ','on ') + @@SERVERNAME
+
+		DECLARE @Html_Title_AlwaysOnfailover VARCHAR(500)='Please check...AG is changing its primary state on ' + @@SERVERNAME + '.   ' +	 ISNULL(@Secondary_replica + ' is secondary replica at this time.','')
+
+		--Variables 
+
+		DECLARE @Html VARCHAR(5000)
+		DECLARE @Html_Title VARCHAR(5000)
+		DECLARE @Html_AlwaysOnfailover VARCHAR(5000)
+		DECLARE @SQL_Text_AlwaysOnfailover VARCHAR(5000)
+
+--assign values to variables to be used in Sp_send_dbmail
+
+		SELECT @P_SERVERNAME = info_value FROM [tb_info] WHERE [Info_Key] = 'SERVERNAME'
+		SELECT @Profile_Name= info_value FROM [tb_info] WHERE [Info_Key]= 'Current-DBA-Profile-Name'
+		SELECT @SQL_Text_AlwaysOnfailover =  'SELECT * FROM #Alwayson_newroles'
+		DECLARE @P_ENVIRONMENT VARCHAR(500)
+		SELECT @P_ENVIRONMENT = INFO_VALUE FROM TB_INFO WHERE INFO_KEY = 'SERVERNAME'
+
+		--SELECT @p_subject = @P_ENVIRONMENT  + '--(Information only)--(!!!Critical!!!-- AG (' + @availability_group_name + ') is changing its state in Alwayson. This may lead to Fail-over in Automatic-failover condition)' +'('+CONVERT(VARCHAR, GETDATE(), 9) + ')' 
+		
+		--SELECT @Html_Title = '<html><p><strong><span style="background-color:#eeeeee;"> '+ @Html_Title_AlwaysOnfailover +'</span></strong></p><br></body></html>'
+		SELECT @Html_Title = '<html><p><strong>'+ @Html_Title_AlwaysOnfailover +'</strong></p><br></body></html>'
+		--DECLARE @SqlQuery2 AS NVARCHAR(4000)  
+  DECLARE @Html2 AS NVARCHAR(MAX)  
+  --DECLARE @p_body2 AS NVARCHAR(MAX)
+  DECLARE @HtmlFillerTable AS NVARCHAR(MAX)
+ 
+ -- CREATE TABLE #TempTableForConvertToHTML981   
+ --(  
+ -- [Responsible Team] NVARCHAR(1000),   
+ -- [Alert Source] NVARCHAR(1000),  
+ -- [Host Name] NVARCHAR(1000)  
+ --) 
+ 
+ --INSERT INTO #TempTableForConvertToHTML981 ([Responsible Team],[Alert Source],[Host Name])  
+ --SELECT 'DBA Team','SQL Job',@@servername
+ --SET @p_body2 = '<html><p><strong>Note: The Server Time(EST) is operating on:  '  + CONVERT(VARCHAR(30), GETDATE(), 121)+'</strong></p></body></html>' 
+ --SET @SqlQuery2 = 'SELECT [Responsible Team],[Alert Source],[Host Name] FROM #TempTableForConvertToHTML981'  
+ --EXEC [dbo].[p_DBA_ConvertTableToHtml] @SqlQuery2, @Html2 OUTPUT  
+  
+   SET @Html2 = REPLACE(@Html2,'&lt;','<')  
+   SET @Html2 = REPLACE(@Html2,'&gt;','>')
+   SET @HtmlFillerTable = '<HTML><BR><BR></HTML>'
+--Converts the output to html format with the help of Proc
+		EXECUTE  dbo.p_DBA_ConvertTableToHtml @SQL_Text_AlwaysOnfailover,@Html_AlwaysOnfailover OUTPUT   
+
+		SELECT @Html  =@Html_Title + @Html_AlwaysOnfailover 
+
+
+		DECLARE @OBJECT_NAME VARCHAR(MAX),@Responsible_team_ VARCHAR(100),@Type_mail VARCHAR(100),@p_subject_out AS VARCHAR(5000)
+	,@SUBJECT_LINE VARCHAR(MAX),@Html_out VARCHAR(MAX)
+	  Select @OBJECT_NAME=OBJECT_NAME(@@PROCID),@Responsible_team_='App Team' , @Type_mail='Information only'
+	,@SUBJECT_LINE='(!!!Critical!!!-- AG (' + @availability_group_name + ') is changing its state in Alwayson. This may lead to Fail-over in Automatic-failover condition)'
+
+EXEC P_DBA_EMAIL_SUBJECT_FORMAT @Type_mail ,@p_subject_out OUTPUT,@subject_line,@Html_out OUTPUT,@Responsible_team_
+  
+  SET @Html=isnull(@Html_out,'')+@html
+
+  EXECUTE  [dbo].[p_dba_send_email]
+	@ToEmail =@p_recipients,
+	@object_name=@object_name,
+	@p_subject  =@p_subject_out,
+	@html =@Html
+
+
+
+		--EXEC msdb.dbo.SP_SEND_DBMAIL
+		--		@Profile_name=@Profile_Name
+		--		,@recipients	= @p_recipients 
+		--		,@subject		= @p_subject
+		--		,@body		= @Html
+		--		,@body_format = 'html'	
+
+				END
+				END			
+
+
